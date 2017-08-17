@@ -1,0 +1,293 @@
+---
+title: "Effects of Super Bowl LI on TABC Revenues in Houston"
+author: "Ian Wells (@ianwells)"
+date: "2017-04-11"
+output:
+  html_document:
+    highlight: tango
+    mathjax: null
+    number_sections: yes
+    theme: spacelab
+    toc: yes
+    toc_float: yes
+---
+  
+(As seen at http://swamplot.com/who-won-out-on-the-super-bowl-liquor-sales-boost-treasures-cle-axelrad-and-more/2017-04-12/ !)
+(Playing along at home?  Download the .Rmd for a list of libraries you'll need!)
+ 
+```{r include = FALSE}    
+library(ggplot2)
+library(ggmap)
+library(dplyr)
+library(knitr)
+library(lubridate)
+library(reshape)
+library(CausalImpact)
+library(rddtools)
+library(forecast)
+select <- dplyr::select
+
+esub <- data.frame(matrix(nrow = 1, ncol = 3))
+names(esub) <- c('begin','end','name')
+esub[1,] <- c('2017-02-01','2017-02-01','Super Bowl LI')
+esub$begin <- as.Date(esub$begin)
+esub$end <- as.Date(esub$end) 
+
+#easter egg: hiding some Holt Winters code here
+#tabc.hw <- HoltWinters(tabc.m.ts)
+#forecast <- predict(tabc.hw, n.ahead = 6, prediction.interval = T, level = 0.9)
+#plot(tabc.hw, forecast); lines(tabc.m.post.ts,col='green')
+#effect <- tabc.m.post.ts - forecast
+#effect[1] #8.3 million extra over Modeled Feb 2017
+
+```
+   
+#Background
+
+In February of 2017, the Super Bowl took place in Houston, Texas, for the first time since 2004.  While the event is ostensibly about football, cities often plan for years ahead of time before hosting the Big Game in order to effectively handle the influx of sports fans, celebrities, major media companies, high rollers, and haggard townies looking to party in the national spotlight.  
+
+The TABC (Texas Alcoholic Beverage Commission) Mixed Beverage Tax is a fixed tax charged on alcoholic beverages sold by a holder of a Mixed Beverage License in the state of Texas.  There exists a record of how much every license holder pays per month, and since the tax is fixed, you can calculate the revenue upon which the tax was paid very simply.  This data is also public, which is wonderful.  With it, you can do all sorts of things, including, I hope, estimate the effect of hosting the Super Bowl on bar sales.  For this, we'll need a big set of data in addition to just February 2017's sales, let's start with 6 years and see how it goes.
+
+If you're inclined, you can get the data for yourself here:
+* https://www.comptroller.texas.gov/transparency/open-data/search-datasets/
+
+Or, you can pull it from a few related projects on my github, http://github.com/ianwells.
+
+Let's get started!  What does the data look like?
+
+#Data
+
+```{r warning = FALSE}
+tabc <- read.csv('tabc.csv')
+tabc$date <- as.Date(tabc$date)
+tabc$rev <- as.numeric(as.character(tabc$rev))
+tabc$yoy_rev <- as.numeric(as.character(tabc$yoy_rev))
+tabc$mom_rev <- as.numeric(as.character(tabc$mom_rev))
+tabc$lat <- as.numeric(as.character(tabc$lat))
+tabc$lng <- as.numeric(as.character(tabc$lng))
+
+tabc$rev[tabc$rev == 0]<-NA
+tabc$yoy_rev[tabc$yoy_rev == 0]<-NA
+tabc$mom_rev[tabc$mom_rev == 0]<-NA
+
+tabc$yoy_diff <- tabc$rev - tabc$yoy_rev
+tabc$mom_diff <- tabc$rev - tabc$mom_rev
+
+tabc.sb <- filter(tabc, date == as.Date('2017-02-01'))
+
+```
+
+```{rwarning = FALSE, results = 'asis'}
+kable(head(sample_n(tabc,6)))
+```
+
+Here we have revenues for a few random bars and months within the data.  We also do a couple special things - we convert the address on file for the license holder to a latitude-longitude so that we can map it, and we also estimate the neighborhood the bar is in by seeing which neighborhood-polygon (generously provided by http://zetashapes.com/) it lies in.
+
+To show you what this data looks like for a particular bar, let's pick on Poison Girl, an excellent bar in the Montrose neighborhood.  Great bourbon selection.
+
+```{r}
+ggplot(data = filter(tabc,name == 'POISON GIRL'), mapping = aes(x=date,y=rev)) + geom_line(color='RED')
+
+```
+
+Not bad!  Poison girl, which opened well before 2011 by the way, saw increasing revenues over much of the last six years, but didn't see much of a change during the Super Bowl.
+
+Let's look at somebody a little more Super Bowl-y, like say, The Four Seasons Hotel, a prestigious accommodation in downtown Houston.
+
+```{r}
+ggplot(data = filter(tabc,name == 'SCLV HOUSTON BEVERAGE LLC'), mapping = aes(x=date,y=rev)) + geom_line(color = 'RED')
+
+```
+
+That's what a bump in sales from the Super Bowl looks like.  You'll notice that sometimes the name in the TABC records doesn't exactly match the name of the business - you can bust out a map and see where the address of record is and find a more familiar name.  Trust me that 'SCLV HOUSTON BEVERAGE LLC' is the Four Seasons.
+
+Alright, let's do some math.
+
+#Analysis
+
+So I'd like to answer a couple questions here:
+
+*How much extra bar money came into the city for the Super Bowl?
+*Where was the most extra money spent?
+*What portion of the extra money went to the little guy?
+
+My approach is going to look like this:
+
+*Make a model for bar sales, per bar.
+*Examine the year-over-year, month-over-month, and vs-model change in revenues for the whole city for February.
+*Figure who captured that change in revenues, and make some plots
+*Interpret to see what kind of establishment made the most extra money
+
+Here's what bar sales in Houston look like:
+
+```{r}
+tabc.m <- group_by(tabc,date)
+tabc.m.s <- summarize(tabc.m,sum(rev,na.rm = TRUE))
+names(tabc.m.s) <- c('date','rev')
+
+ggplot(data = tabc.m.s, mapping = aes(x=date,y=rev)) + geom_line(color = 'RED')
+```
+
+Just looking at total bar sales for the whole city, you probably wouldn't notice anything special about February 2017.  What we can do though, is see about forecasting sales for February 2017, and if the real sales are different, we can try to attribute that to the Super Bowl.
+
+One way to forecast sales is to just take a comparable month (say from a year ago, to accommodate seasonal changes month-to-month) and call it your forecast sales.  For a mature bar, you might reason, February this year should look the same as February last year, if you assume nothing has changed.  If you know that one thing is different between the two months, like say the Super Bowl happened, then maybe you can attribute any difference solely to the influence of the Super Bowl.
+
+This is, of course, a poor way to predict sales.  A lot of things can change in a year, not to mention a bar might not have even been open in February 2016.  Even if you look at the whole city's sales things can change a lot year-over-year, Super Bowls notwithstanding.
+
+Another way to do it is just by looking at month-over-month sales, but that only works if you can expect every month to sort of look the same as a baseline.  This of course isn't true for every month, since bar sales are very seasonal, with major drinking holidays or recurring events causing predictable spikes in sales.  Some months are more similar than others though - you could do worse than comparing your Februaries to last August, for example, but this really depends on the bar.
+
+A better way would be to use some sort of model to forecast sales for a given month.  We've used ETS models before, which take into account seasonal effects as well as long-term trends in data to come up with a fairly solid prediction for sales.  We can argue that if our sales don't match the model, it's due to some exogenous thing that occurred that month, which of course would be the Super Bowl.
+
+A disadvantage there is that we need a few months data to get a good model built that way, so we won't be able to use it for very new bars.  For those, we'll use either year-over-year or month-over-month numbers.
+
+#Finding Excess Sales
+
+Alright.  So how much extra money got spent in February 2017, vs February 2016?
+
+```{r}
+tabc.m.s[74,] - tabc.m.s[73,] #12.1 million extra over Jan 2017
+tabc.m.s[74,] - tabc.m.s[62,] #9.1 million extra over Feb 2016
+
+
+tabc.m.s.pre <- filter(tabc.m.s,date <= '2017-1-01')
+tabc.m.s.post <- filter(tabc.m.s,date >= '2017-2-01') #this is just to illustrate, it can be off by one month
+
+tabc.m.ts <- ts(tabc.m.s.pre$rev, start = c(2011, 1), frequency = 12)
+tabc.m.post.ts <- ts(tabc.m.s.post$rev, start = c(2017, 2), frequency = 12)
+
+plot(stl(tabc.m.ts, s.window="periodic"))
+```
+
+Took a quick break to show you the periodic components in the revenue signal.  Check out the broad upward trend, in addition to the seasonal peaks.  Now let's make the model.
+
+```{r}
+tabc.ets <- ets(tabc.m.ts, model = 'ZZZ')
+forecast.ets <- predict(tabc.ets, n.ahead = 1, prediction.interval = T, level = 0.9)
+
+plot(forecast.ets); points(tabc.m.post.ts,col='red',lwd = 2)
+```
+
+The full forecast, let's zoom in:
+```{r}
+plot(forecast.ets,xlim=c(2016,2017.5)); points(tabc.m.post.ts,col='red',lwd = 2)
+```
+
+That red circle is the real sales figure for Feburary 2017, the blue line is the prediction not including the Super Bowl, and the grey bars are the level that the model is 90% sure the prediction fits in.  Notice how the red circle sits confidently above the grey bars - we're more than 90% sure the real Feburary 2017 is a statistical outlier, a good indication that the Super Bowl did impact bar sales.  Can we get a number for that?
+
+```{r}
+effect.ets <- tabc.m.post.ts - forecast.ets$mean
+effect.ets
+```
+
+There you go, about 8.9 million extra dollars, according to our ETS model.  A little less than the year-over-year difference, probably due to a slight upward trend in bar sales over that time frame.  Also worth point out is that ETS tells us there's a bit of a range on that number - a few million in either direction.
+
+So, where did it go?  Where did that money get spent?  Let's see if we can do that again, per bar.
+We'll calculate a composite difference - we'll use the ETS model if we can, followed by the year-over-year difference if we have it, resorting to month-over-month as a last resort.  We'll call that number - the extra cash a bar made during February 2017 - the Composite Difference, or `composite_diff`.  The raw revenue for that month we'll call `rev`.
+
+
+```{r warning = FALSE}
+
+bars <- unique(tabc.sb$name) #fun fact: 1814 unique licenseholders in Houston during the SB
+bars.effect <- data.frame(matrix(nrow=length(bars),ncol=2))
+names(bars.effect) <- c('name','model_diff')
+
+for (i in 1:length(bars)) 
+  {
+  this_bar <- bars[i]
+  tabc.b <- filter(tabc, name == this_bar)
+  tabc.b.pre <- filter(tabc.b,date <= '2017-1-01')
+  tabc.b.post <- filter(tabc.b,date >= '2017-2-01')
+
+  tryCatch({
+    tabc.b.ts <- ts(tabc.b.pre$rev, start = c(2011, 1), frequency = 12)
+    tabc.b.post.ts <- ts(tabc.b.post$rev, start = c(2017, 2), frequency = 12)
+
+    tabc.b.ets <- ets(tabc.b.ts, model = 'ZZZ')
+    forecast.b <- predict(tabc.b.ets, n.ahead = 1, prediction.interval = T, level = 0.9)
+    data.frame(forecast.b)
+    effect <- tabc.b.post.ts - forecast.b$mean
+    bars.effect[i,]<-c(as.character(this_bar),effect[1])
+  },warning=function(w){bars.effect[i,]<-c(as.character(this_bar),NA)
+  },error=function(e) {bars.effect[i,]<-c(as.character(this_bar),NA)
+  })
+}
+
+bars.effect$model_diff <- as.numeric(bars.effect$model_diff)
+
+tabc.sb <- left_join(tabc.sb, bars.effect,by= "name")
+tabc.sb$composite_diff <- coalesce(tabc.sb$model_diff,tabc.sb$yoy_diff,tabc.sb$mom_diff) 
+
+tabc.sb.o <- arrange(tabc.sb, desc(composite_diff))
+
+ggplot(tabc.sb.o, aes(composite_diff)) + geom_density() + xlim(-10000,250000)
+```
+
+That composite difference is pretty spread out - this distribution has a long, long tail.  If you saw an extra $25,000 during the Super Bowl, you did better than nearly 95% of the bars in Houston.
+
+```{r warning = FALSE}
+ggmap(get_map(location = "houston", zoom = 12)) + geom_density2d(data = filter(tabc.sb, composite_diff > 100000), 
+    aes(x = lng, y = lat), size = 0.2) + stat_density2d(data = filter(tabc.sb, composite_diff > 100000), 
+    aes(x = lng, y = lat, fill = ..level.., alpha = 0.01), size = 0.01, 
+    bins = 16, geom = "polygon") +
+    scale_alpha(range = c(0, 0.3), guide = FALSE)
+```
+
+This is where the big money went, geographically speaking - no surprises here, those are also major concentrations of bars and fun stuff.
+
+Let's see who those bars are - the fortunate few who really raked in the cash.
+
+#Results
+
+```{r results = 'asis'}
+kable(select(head(tabc.sb.o,100),name,composite_diff,rev))
+```
+
+And there you have it!  The top 100 money-making liquor license holders in Houston during the Super Bowl.
+
+Aramark is the company that has the catering and liquor license for NRG Stadium and a lot of the other official Super Bowl events around town.  Underdogs Sports Pub is a small local bar that somehow handled the liquor for Club Nomadic, a traveling superclub that hosted a Taylor Swift concert during Super Bowl weekend as well as a number of other high-profile events.  Rose Club is otherwise known in town as Clé.  SCLV Houston Beverage LLC is the Four Seasons Hotel.  Treasures is a gentleman's club that Drake sings about sometimes (TMC Beverages of Houston is also known as The Men's Club).  I can't explain how a Chili's got on the list, but that Chili's must have been pretty lit.
+
+Let's use this to answer that question we had - how much of this extra money went to big companies, which make money on the Superbowl every year?  We'll focus on the top 20 bars.
+
+```{r}
+
+top20 <- tabc.sb.o[1:20,]
+top20$local <- TRUE
+
+corps <- c(1,2,3,5,7,8,9,15)
+
+top20$local[corps] <- FALSE
+
+plot <- ggplot(top20, aes(x="", y=composite_diff, fill=local)) +
+geom_bar(width = 1, stat = "identity") + 
+  coord_polar("y", start=0)
+
+plot
+
+corps.made <- sum(tabc.sb.o[corps,12]) #3486243
+all.made <- sum(tabc.sb.o[1:20,12]) #6139314
+```
+
+So for the Top 20 bars, which made about 6 million of the extra dough, 8 of them were non-local and they made about 55% of the excess revenues.
+
+Fun!  That's all we're going to do today.
+
+#Disclaimers
+
+##TABC
+>The Comptroller of Public Accounts cannot vouch for the data or analysis derived from data after it has been retrieved from the Comptroller's Web site.
+
+Some numbers in the R may vary slightly from the numbers in the text, as some models are rolled at render-time and may involve some randomness.
+
+#License
+
+The MIT License (MIT)
+
+Copyright (c) 2017 Ian Wells
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
